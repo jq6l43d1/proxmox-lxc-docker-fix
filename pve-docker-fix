@@ -8,7 +8,7 @@
 
 set -e
 
-CTID="${1:-}"
+CTID=""
 
 show_usage() {
     cat <<EOF
