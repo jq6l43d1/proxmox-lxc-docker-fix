@@ -1,0 +1,338 @@
+#!/bin/bash
+
+# pve-docker-rollback - Remove AppArmor workaround from Proxmox LXC containers
+# Rollback the CVE-2025-52881 fix when upstream solutions are available
+#
+# Usage: pve-docker-rollback [options]
+# Example: pve-docker-rollback 105
+
+set -e
+
+CTID=""
+MODE="single"
+NO_RESTART=false
+DRY_RUN=false
+FORCE=false
+
+show_usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTION]
+
+Remove the AppArmor workaround for CVE-2025-52881 from LXC containers.
+Use this when upstream fixes are available and the workaround is no longer needed.
+
+Options:
+  <CTID>        Remove workaround from specific container
+  --all         Remove workaround from all affected containers
+  --list        List all containers with the workaround applied
+  --dry-run     Preview changes without modifying any files
+  --no-restart  Don't restart containers (changes apply on next start)
+  --force       Skip confirmation prompts
+  -h, --help    Show this help message
+
+Examples:
+  $(basename "$0") 105              # Rollback container 105
+  $(basename "$0") --list           # List affected containers
+  $(basename "$0") --all            # Rollback all containers
+  $(basename "$0") 105 --dry-run    # Preview changes for container 105
+  $(basename "$0") --all --force    # Rollback all without confirmation
+
+See: https://github.com/opencontainers/runc/issues/4968
+EOF
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        --all)
+            MODE="all"
+            shift
+            ;;
+        --list)
+            MODE="list"
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --no-restart)
+            NO_RESTART=true
+            shift
+            ;;
+        --force)
+            FORCE=true
+            shift
+            ;;
+        *)
+            if [[ -z "$CTID" ]] && [[ "$1" =~ ^[0-9]+$ ]]; then
+                CTID="$1"
+            else
+                echo "Error: Unknown argument: $1"
+                show_usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Verify we're running on Proxmox
+if [[ ! -f "/usr/sbin/pct" ]]; then
+    echo "Error: This script must be run on a Proxmox VE host"
+    exit 1
+fi
+
+# Check if workaround is applied to a container
+check_workaround() {
+    local ctid="$1"
+    local conf="/etc/pve/lxc/${ctid}.conf"
+
+    if [[ ! -f "$conf" ]]; then
+        return 1
+    fi
+
+    # Look for the CVE comment as the definitive marker
+    if grep -q "CVE-2025-52881" "$conf" 2>/dev/null; then
+        return 0
+    fi
+
+    # Fallback: check for the apparmor line
+    if grep -q "lxc.apparmor.profile: unconfined" "$conf" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Get list of all containers with workaround
+get_affected_containers() {
+    local containers=()
+
+    for conf in /etc/pve/lxc/*.conf 2>/dev/null; do
+        if [[ -f "$conf" ]]; then
+            local ctid=$(basename "$conf" .conf)
+            if check_workaround "$ctid"; then
+                containers+=("$ctid")
+            fi
+        fi
+    done
+
+    echo "${containers[@]}"
+}
+
+# Get container OS type
+get_os_type() {
+    local ctid="$1"
+    pct config "$ctid" 2>/dev/null | grep "^ostype:" | awk '{print $2}' || echo "unknown"
+}
+
+# Get container status
+get_status() {
+    local ctid="$1"
+    pct status "$ctid" 2>/dev/null | awk '{print $2}' || echo "unknown"
+}
+
+# Remove workaround from a container
+remove_workaround() {
+    local ctid="$1"
+    local conf="/etc/pve/lxc/${ctid}.conf"
+
+    if [[ ! -f "$conf" ]]; then
+        echo "Error: Container $ctid not found"
+        echo "Config file does not exist: $conf"
+        return 1
+    fi
+
+    if ! check_workaround "$ctid"; then
+        echo "No workaround found in container $ctid"
+        echo "Nothing to remove."
+        return 0
+    fi
+
+    local ostype=$(get_os_type "$ctid")
+    local status=$(get_status "$ctid")
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "=========================================="
+        echo "DRY RUN: Container $ctid"
+        echo "=========================================="
+        echo "OS Type: $ostype"
+        echo "Status: $status"
+        echo ""
+        echo "Would remove the following lines:"
+        grep -B 1 -A 3 "CVE-2025-52881\|lxc.apparmor.profile: unconfined" "$conf" | grep -v "^--$" || echo "  (workaround lines)"
+        echo ""
+        if [[ "$status" == "running" ]] && [[ "$NO_RESTART" == false ]]; then
+            echo "Would require container restart"
+        fi
+        echo ""
+        return 0
+    fi
+
+    echo "=========================================="
+    echo "Rolling Back Container $ctid"
+    echo "=========================================="
+    echo "OS Type: $ostype"
+    echo "Status: $status"
+    echo ""
+
+    # Show what will be removed
+    echo "Lines to be removed:"
+    grep -B 1 -A 3 "CVE-2025-52881\|lxc.apparmor.profile: unconfined" "$conf" | grep -v "^--$" || echo "  (workaround lines)"
+    echo ""
+
+    # Confirmation
+    if [[ "$FORCE" == false ]]; then
+        if [[ "$status" == "running" ]] && [[ "$NO_RESTART" == false ]]; then
+            echo "Container is running and will need to be restarted."
+        fi
+        read -p "Remove workaround from container $ctid? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Skipped container $ctid"
+            return 0
+        fi
+    fi
+
+    # Stop container if running
+    if [[ "$status" == "running" ]] && [[ "$NO_RESTART" == false ]]; then
+        echo "Stopping container $ctid..."
+        pct stop "$ctid"
+    fi
+
+    # Create temp file and remove workaround lines
+    local tmpfile=$(mktemp)
+
+    # Remove comment block and config lines related to CVE-2025-52881
+    awk '
+        /# AppArmor workaround for CVE-2025-52881/ { in_block=1; next }
+        /# Added by pve-docker-fix on/ { if (in_block) next }
+        /# Added automatically by pve-script-wrapper/ { if (in_block) next }
+        /# See: https:\/\/github.com\/opencontainers\/runc\/issues\/4968/ { if (in_block) { next } }
+        /^lxc\.apparmor\.profile: unconfined/ { if (in_block) { in_block=0; next } }
+        /^lxc\.mount\.entry:.*sys\/module\/apparmor\/parameters\/enabled/ { next }
+        { print; in_block=0 }
+    ' "$conf" > "$tmpfile"
+
+    # Verify temp file is not empty
+    if [[ ! -s "$tmpfile" ]]; then
+        echo "Error: Generated config file is empty. Aborting."
+        rm -f "$tmpfile"
+        return 1
+    fi
+
+    # Replace original config
+    mv "$tmpfile" "$conf"
+
+    echo "✓ Workaround removed from container $ctid"
+
+    # Restart container if it was running
+    if [[ "$status" == "running" ]] && [[ "$NO_RESTART" == false ]]; then
+        echo "Starting container $ctid..."
+        pct start "$ctid"
+        echo "✓ Container restarted"
+    elif [[ "$NO_RESTART" == true ]]; then
+        echo "  (Restart skipped - changes will apply on next start)"
+    fi
+
+    echo ""
+}
+
+# List mode
+if [[ "$MODE" == "list" ]]; then
+    echo "Containers with CVE-2025-52881 workaround applied:"
+    echo ""
+
+    containers=($(get_affected_containers))
+
+    if [[ ${#containers[@]} -eq 0 ]]; then
+        echo "  No containers found with the workaround"
+        exit 0
+    fi
+
+    for ctid in "${containers[@]}"; do
+        ostype=$(get_os_type "$ctid")
+        status=$(get_status "$ctid")
+        echo "  $ctid (${ostype}, ${status})"
+    done
+
+    echo ""
+    echo "Total: ${#containers[@]} container(s)"
+    echo ""
+    echo "To remove workaround: $(basename "$0") <CTID>"
+    echo "To remove from all:   $(basename "$0") --all"
+    exit 0
+fi
+
+# All containers mode
+if [[ "$MODE" == "all" ]]; then
+    containers=($(get_affected_containers))
+
+    if [[ ${#containers[@]} -eq 0 ]]; then
+        echo "No containers found with the workaround applied"
+        exit 0
+    fi
+
+    echo "=========================================="
+    echo "Rollback All Containers"
+    echo "=========================================="
+    echo ""
+    echo "Found ${#containers[@]} container(s) with workaround:"
+
+    for ctid in "${containers[@]}"; do
+        ostype=$(get_os_type "$ctid")
+        status=$(get_status "$ctid")
+        echo "  $ctid (${ostype}, ${status})"
+    done
+
+    echo ""
+
+    if [[ "$FORCE" == false ]] && [[ "$DRY_RUN" == false ]]; then
+        read -p "Remove workaround from all ${#containers[@]} container(s)? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+        echo ""
+    fi
+
+    success_count=0
+    for ctid in "${containers[@]}"; do
+        if remove_workaround "$ctid"; then
+            ((success_count++)) || true
+        fi
+    done
+
+    if [[ "$DRY_RUN" == false ]]; then
+        echo "=========================================="
+        echo "✓ Rollback Complete"
+        echo "=========================================="
+        echo "Processed: ${#containers[@]} container(s)"
+        echo "Success: $success_count"
+        echo ""
+    fi
+
+    exit 0
+fi
+
+# Single container mode
+if [[ -z "$CTID" ]]; then
+    echo "Error: Container ID required"
+    echo ""
+    show_usage
+    exit 1
+fi
+
+remove_workaround "$CTID"
+
+if [[ "$DRY_RUN" == false ]]; then
+    echo "=========================================="
+    echo "✓ Rollback Complete"
+    echo "=========================================="
+fi

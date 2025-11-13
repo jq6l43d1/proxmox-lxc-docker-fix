@@ -25,11 +25,12 @@ While downgrading runc below 1.2.7/1.3.2 would "fix" the issue, it exposes your 
 
 ## ✅ The Solution
 
-This repository provides three tools that automatically apply the AppArmor workaround to Proxmox LXC containers:
+This repository provides tools that automatically apply and manage the AppArmor workaround for Proxmox LXC containers:
 
 1. **`pve-script-wrapper.sh`** - Universal wrapper for Proxmox community scripts
 2. **`pve-docker-fix`** - Fix existing containers that are already broken
-3. **`pct-patched`** - Internal wrapper (used automatically by pve-script-wrapper.sh)
+3. **`pve-docker-rollback`** - Remove the workaround when upstream fixes are available
+4. **`pct-patched`** - Internal wrapper (used automatically by pve-script-wrapper.sh)
 
 ### How It Works
 
@@ -58,9 +59,10 @@ On your Proxmox VE host, run:
 curl -fsSL https://raw.githubusercontent.com/jq6l43d1/proxmox-lxc-docker-fix/main/pve-script-wrapper.sh -o /usr/local/bin/pve-script-wrapper.sh
 curl -fsSL https://raw.githubusercontent.com/jq6l43d1/proxmox-lxc-docker-fix/main/pct-patched -o /usr/local/bin/pct-patched
 curl -fsSL https://raw.githubusercontent.com/jq6l43d1/proxmox-lxc-docker-fix/main/pve-docker-fix -o /usr/local/bin/pve-docker-fix
+curl -fsSL https://raw.githubusercontent.com/jq6l43d1/proxmox-lxc-docker-fix/main/pve-docker-rollback -o /usr/local/bin/pve-docker-rollback
 
 # Make them executable
-chmod +x /usr/local/bin/pve-script-wrapper.sh /usr/local/bin/pct-patched /usr/local/bin/pve-docker-fix
+chmod +x /usr/local/bin/pve-script-wrapper.sh /usr/local/bin/pct-patched /usr/local/bin/pve-docker-fix /usr/local/bin/pve-docker-rollback
 ```
 
 Or clone the repository:
@@ -68,8 +70,8 @@ Or clone the repository:
 ```bash
 git clone https://github.com/jq6l43d1/proxmox-lxc-docker-fix.git
 cd proxmox-lxc-docker-fix
-chmod +x *.sh pct-patched pve-docker-fix
-cp pve-script-wrapper.sh pct-patched pve-docker-fix /usr/local/bin/
+chmod +x *.sh pct-patched pve-docker-fix pve-docker-rollback
+cp pve-script-wrapper.sh pct-patched pve-docker-fix pve-docker-rollback /usr/local/bin/
 ```
 
 ## 🚀 Usage
@@ -145,6 +147,43 @@ pct start 105
 
 **Note:** Debian containers typically only need the first line. Ubuntu containers need both lines. See [runc#4968](https://github.com/opencontainers/runc/issues/4968) for technical details.
 
+### Rolling Back the Fix
+
+When upstream fixes are available (Proxmox/LXC/AppArmor updates), you can remove the workaround:
+
+```bash
+# List all containers with the workaround
+pve-docker-rollback --list
+
+# Remove from specific container
+pve-docker-rollback 105
+
+# Preview changes without modifying
+pve-docker-rollback 105 --dry-run
+
+# Remove from all containers at once
+pve-docker-rollback --all
+
+# Remove without restart (changes apply on next start)
+pve-docker-rollback 105 --no-restart
+
+# Remove from all containers without confirmation
+pve-docker-rollback --all --force
+```
+
+The rollback tool will:
+1. Detect if the workaround is applied
+2. Show which lines will be removed
+3. Request confirmation (unless `--force`)
+4. Remove the AppArmor configuration
+5. Restart the container if needed
+
+**When to rollback:**
+- Wait for announcements that upstream fixes are available
+- Monitor [runc#4968](https://github.com/opencontainers/runc/issues/4968) for updates
+- Test on non-critical containers first
+- Verify Docker/containers work after rollback before removing from production
+
 ## 🔧 How It Works Technically
 
 ### pve-script-wrapper.sh
@@ -167,6 +206,15 @@ pct start 105
 - Applies only necessary configuration lines based on OS
 - Handles container stop/start with user confirmation
 - Safe to run multiple times
+
+### pve-docker-rollback
+- Removes the AppArmor workaround when no longer needed
+- Scans all containers to find those with workaround applied
+- Safely removes comment blocks and configuration lines
+- Supports single container, batch (--all), or list mode
+- Dry-run mode to preview changes before applying
+- Handles container restart with confirmation
+- Idempotent and safe to run multiple times
 
 ## 🛡️ Security Considerations
 
@@ -298,9 +346,17 @@ pve-script-wrapper.sh <script-url>
 # Fix existing container
 pve-docker-fix <container-id>
 
+# List containers with workaround
+pve-docker-rollback --list
+
+# Remove workaround (when upstream fixes available)
+pve-docker-rollback <container-id>
+pve-docker-rollback --all
+
 # Get help
 pve-script-wrapper.sh --help
 pve-docker-fix --help
+pve-docker-rollback --help
 ```
 
 ---
