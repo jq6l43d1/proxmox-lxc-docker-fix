@@ -113,14 +113,14 @@ check_workaround() {
 get_affected_containers() {
     local containers=()
 
-    for conf in /etc/pve/lxc/*.conf 2>/dev/null; do
+    for conf in /etc/pve/lxc/*.conf; do
         if [[ -f "$conf" ]]; then
             local ctid=$(basename "$conf" .conf)
             if check_workaround "$ctid"; then
                 containers+=("$ctid")
             fi
         fi
-    done
+    done 2>/dev/null
 
     echo "${containers[@]}"
 }
